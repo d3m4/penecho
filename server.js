@@ -162,7 +162,7 @@ function providerRequest(key, model, text, atlasImage = null) {
     : [{ role: "user", content: text }];
   return {
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-    body: JSON.stringify({ model, reasoning_effort: API_EFFORT, ...(atlasImage ? { temperature: 0.15, response_format: { type: "json_object" } } : { max_tokens: 10, temperature: 0 }), messages }),
+    body: JSON.stringify({ model, reasoning_effort: API_EFFORT, ...(atlasImage ? { temperature: 0.15, response_format: { type: "text" } } : { max_tokens: 10, temperature: 0 }), messages }),
   };
 }
 
@@ -198,7 +198,16 @@ const THEME_PERSONAS = {
 
 function send(res, code, data, type = "application/json; charset=utf-8") { res.writeHead(code, { "Content-Type": type, "Cache-Control": "no-store" }); res.end(typeof data === "string" ? data : JSON.stringify(data)); }
 function readJson(req, limit = MAX_BODY) { return new Promise((resolve, reject) => { let size = 0, chunks = []; req.on("data", c => { size += c.length; if (size > limit) { reject(new Error("Request too large")); req.destroy(); } else chunks.push(c); }); req.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { reject(new Error("Invalid JSON")); } }); req.on("error", reject); }); }
-function log(entry) { try { fs.mkdirSync(LOG_DIR, { recursive:true }); if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size >= MAX_LOG) { try { fs.renameSync(LOG_FILE, `${LOG_FILE}.1`); } catch { fs.truncateSync(LOG_FILE, 0); } } fs.appendFileSync(LOG_FILE, JSON.stringify({ time:new Date().toISOString(), ...entry }) + "\n"); } catch (error) { console.error("PenEcho log error:", error.message); } }
+function logConsole(entry) { // human-readable request lifecycle on stdout; file keeps the full JSON
+  const id = entry.requestId ? ` ${String(entry.requestId).slice(0, 8)}` : "";
+  if (entry.type === "ai") {
+    if (entry.status === 200) console.log(`[AI${id}] ✓ respondeu · intent=${entry.intent} · ${entry.commandCount} cmd · ${entry.elapsedMs}ms${entry.attempts > 1 ? ` · ${entry.attempts} tentativas` : ""}`);
+    else if (entry.status === 499) console.log(`[AI${id}] ⊘ cancelado (cliente desconectou)`);
+    else console.log(`[AI${id}] ✗ ERRO ${entry.status} · ${entry.error || "?"}`);
+  } else if (entry.type === "ai-retry") console.log(`[AI${id}] ↻ tentando de novo (${entry.reason})`);
+  else if (entry.type === "ai-image-format-fallback") console.log(`[AI${id}] ↻ modelo recusou ${entry.from}, reenviando ${entry.to} (${entry.upstreamStatus})`);
+}
+function log(entry) { try { logConsole(entry); } catch {} try { fs.mkdirSync(LOG_DIR, { recursive:true }); if (fs.existsSync(LOG_FILE) && fs.statSync(LOG_FILE).size >= MAX_LOG) { try { fs.renameSync(LOG_FILE, `${LOG_FILE}.1`); } catch { fs.truncateSync(LOG_FILE, 0); } } fs.appendFileSync(LOG_FILE, JSON.stringify({ time:new Date().toISOString(), ...entry }) + "\n"); } catch (error) { console.error("PenEcho log error:", error.message); } }
 function short(value, length = 20000) { return typeof value === "string" ? value.slice(0, length) : value; }
 function visibleCliDiagnostic(value) {
   return String(value || "").replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, " ").replace(/\s+/g, " ").trim().slice(0, 800);
@@ -739,6 +748,7 @@ const server = http.createServer(async (req, res) => {
       const submittedPayload = await readJson(req);
       if (!validPayload(submittedPayload)) { log({ type:"ai", requestId, ip, status:400, error:"Invalid viewport-image payload." }); return send(res, 400, { error: "Invalid viewport-image payload.", requestId }); }
       const payload = canonicalPayload(submittedPayload);
+      console.log(`[AI ${requestId.slice(0,8)}] ◀ recebeu do tablet · ação=${payload.userAction} · trigger=${payload.trigger}`);
       const configurationError=providerConfigurationError();
       if (configurationError) { log({ type:"ai", requestId, ip, status:400, error:configurationError }); return send(res, 400, { error:configurationError, requestId }); }
       if (LOCAL_CLI) {
@@ -772,6 +782,7 @@ const server = http.createServer(async (req, res) => {
           return callModelWithTrace(requestTrace,attempts,modelInput,activeAtlasImage,retryInstruction,clientController.signal,`png-fallback-after-${format}-rejection`);
         }
       };
+      console.log(`[AI ${requestId.slice(0,8)}] → enviando ao modelo (${Math.round((imageTransport.preferred?.bytes||0)/1024)}KB ${imageTransport.preferred?.mimeType||"?"}), aguardando resposta...`);
       let model=await requestModel();
       if (LOCAL_CLI) ensureCurrentLocalRequest(localRun);
       saveLatestModelExchange(requestId,attempts,modelInput,"",model);
